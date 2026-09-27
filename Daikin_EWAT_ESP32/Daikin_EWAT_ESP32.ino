@@ -3,10 +3,26 @@
 #include <ESPmDNS.h>
 #include <ArduinoOTA.h>
 #include <Update.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include <Preferences.h>
 
 WebServer server(80);
+Preferences preferences;
 
 const char* OTA_HOSTNAME = "daikin-simulator";
+
+const char* FIRMWARE_VERSION = "1.1.0";
+const char* GITHUB_VERSION_URL =
+  "https://raw.githubusercontent.com/dorobantu/-daikin-ewat-esp32/main/firmware/version.txt";
+const char* GITHUB_BIN_URL =
+  "https://raw.githubusercontent.com/dorobantu/-daikin-ewat-esp32/main/firmware/Daikin_EWAT_ESP32.ino.bin";
+
+bool githubAutoUpdate = false;
+String githubLatestVersion = "necunoscuta";
+String githubStatus = "Nu a fost verificat";
+unsigned long lastGithubCheck = 0;
+const unsigned long GITHUB_CHECK_INTERVAL_MS = 6UL * 60UL * 60UL * 1000UL;
 
 const int DAC_EVAP = 25;
 const int DAC_COND = 26;
@@ -156,6 +172,239 @@ String stateName() {
   return "UNKNOWN";
 }
 
+long versionNumber(String v) {
+  v.trim();
+  int a = 0, b = 0, c = 0;
+  sscanf(v.c_str(), "%d.%d.%d", &a, &b, &c);
+  return (long)a * 1000000L + (long)b * 1000L + c;
+}
+
+bool githubUpdateAvailable() {
+  if (githubLatestVersion.length() == 0 ||
+      githubLatestVersion == "necunoscuta") {
+    return false;
+  }
+
+  return versionNumber(githubLatestVersion) >
+         versionNumber(String(FIRMWARE_VERSION));
+}
+
+bool checkGithubVersion() {
+  if (WiFi.status() != WL_CONNECTED) {
+    githubStatus = "Fara conexiune Wi-Fi";
+    return false;
+  }
+
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  HTTPClient http;
+  http.setTimeout(10000);
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+
+  if (!http.begin(client, GITHUB_VERSION_URL)) {
+    githubStatus = "Nu pot deschide URL-ul GitHub";
+    return false;
+  }
+
+  int code = http.GET();
+
+  if (code != HTTP_CODE_OK) {
+    githubStatus = "GitHub HTTP " + String(code);
+    http.end();
+    return false;
+  }
+
+  String remoteVersion = http.getString();
+  http.end();
+
+  remoteVersion.trim();
+
+  if (remoteVersion.length() == 0) {
+    githubStatus = "version.txt este gol";
+    return false;
+  }
+
+  githubLatestVersion = remoteVersion;
+
+  if (githubUpdateAvailable()) {
+    githubStatus =
+      "Versiune noua disponibila: " +
+      githubLatestVersion;
+  } else {
+    githubStatus =
+      "Firmware la zi";
+  }
+
+  return true;
+}
+
+bool downloadGithubFirmware(String &message) {
+  if (WiFi.status() != WL_CONNECTED) {
+    message = "Fara conexiune Wi-Fi";
+    return false;
+  }
+
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  HTTPClient http;
+  http.setTimeout(20000);
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+
+  if (!http.begin(client, GITHUB_BIN_URL)) {
+    message = "Nu pot deschide firmware-ul GitHub";
+    return false;
+  }
+
+  int code = http.GET();
+
+  if (code != HTTP_CODE_OK) {
+    message = "GitHub firmware HTTP " + String(code);
+    http.end();
+    return false;
+  }
+
+  int contentLength = http.getSize();
+
+  if (contentLength <= 0) {
+    message = "Dimensiune firmware invalida";
+    http.end();
+    return false;
+  }
+
+  if (!Update.begin(contentLength)) {
+    message = "Spatiu OTA insuficient";
+    http.end();
+    return false;
+  }
+
+  WiFiClient *stream = http.getStreamPtr();
+  size_t written = Update.writeStream(*stream);
+
+  if (written != (size_t)contentLength) {
+    message =
+      "Download incomplet: " +
+      String(written) +
+      "/" +
+      String(contentLength);
+    http.end();
+    return false;
+  }
+
+  if (!Update.end(true)) {
+    message =
+      "Update error " +
+      String(Update.getError());
+    http.end();
+    return false;
+  }
+
+  http.end();
+  message = "Firmware descarcat si validat";
+  return true;
+}
+
+void handleGithubInfo() {
+  String json = "{";
+  json += "\"local\":\"" + String(FIRMWARE_VERSION) + "\"";
+  json += ",\"remote\":\"" + githubLatestVersion + "\"";
+  json += ",\"status\":\"" + githubStatus + "\"";
+  json += ",\"available\":" + String(githubUpdateAvailable() ? "true" : "false");
+  json += ",\"auto\":" + String(githubAutoUpdate ? "true" : "false");
+  json += "}";
+
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "application/json", json);
+}
+
+void handleGithubCheck() {
+  checkGithubVersion();
+  handleGithubInfo();
+}
+
+void handleGithubAuto() {
+  if (server.hasArg("enable")) {
+    githubAutoUpdate =
+      server.arg("enable") == "1";
+
+    preferences.putBool(
+      "ghAuto",
+      githubAutoUpdate
+    );
+  }
+
+  handleGithubInfo();
+}
+
+void handleGithubUpdate() {
+  checkGithubVersion();
+
+  if (!githubUpdateAvailable()) {
+    server.send(
+      200,
+      "text/html",
+      "<h2>Nu exista o versiune mai noua.</h2>"
+      "<p><a href='/'>Inapoi</a></p>"
+    );
+    return;
+  }
+
+  String message;
+  bool ok = downloadGithubFirmware(message);
+
+  if (!ok) {
+    server.send(
+      500,
+      "text/html",
+      "<h2>Update esuat</h2><p>" +
+      message +
+      "</p><p><a href='/'>Inapoi</a></p>"
+    );
+    return;
+  }
+
+  server.send(
+    200,
+    "text/html",
+    "<h2>Update GitHub OK</h2>"
+    "<p>ESP32 se restarteaza...</p>"
+  );
+
+  delay(1200);
+  ESP.restart();
+}
+
+void processAutomaticGithubUpdate() {
+  if (!githubAutoUpdate ||
+      WiFi.status() != WL_CONNECTED) {
+    return;
+  }
+
+  unsigned long now = millis();
+
+  if (lastGithubCheck != 0 &&
+      now - lastGithubCheck < GITHUB_CHECK_INTERVAL_MS) {
+    return;
+  }
+
+  lastGithubCheck = now;
+
+  if (!checkGithubVersion() ||
+      !githubUpdateAvailable()) {
+    return;
+  }
+
+  String message;
+
+  if (downloadGithubFirmware(message)) {
+    delay(500);
+    ESP.restart();
+  } else {
+    githubStatus = message;
+  }
+}
+
 const char webpage[] PROGMEM = R"rawliteral(
 <!doctype html>
 <html lang="ro">
@@ -207,13 +456,61 @@ STOP: 1500 / 1500 kPa<br>
 <button class="auto" onclick="autoMode()">AUTOMATIC</button>
 </div>
 
-<div class="card"><b>System</b><div class="small" style="margin-top:10px">IP: <span id="ip">...</span></div>
-<button class="fw" onclick="location.href='/update'">FIRMWARE UPDATE</button></div>
+<div class="card"><b>System</b>
+<div class="small" style="margin-top:10px">
+IP: <span id="ip">...</span><br>
+Firmware instalat: <span id="fwlocal">...</span><br>
+Firmware GitHub: <span id="fwremote">...</span><br>
+Status GitHub: <span id="ghstatus">...</span>
+</div>
+
+<button class="fw" onclick="githubCheck()">CHECK GITHUB</button>
+<button class="fw" onclick="githubUpdate()">UPDATE FROM GITHUB</button>
+<button id="ghauto" class="fw" onclick="githubToggle()">AUTO UPDATE: ...</button>
+<button class="fw" onclick="location.href='/update'">UPLOAD BIN MANUAL</button>
+</div>
 </div>
 
 <script>
 function manualMode(){fetch('/manual?evap='+me.value+'&cond='+mc.value)}
 function autoMode(){fetch('/auto')}
+
+function githubRefresh(){
+ fetch('/github-info',{cache:'no-store'}).then(r=>r.json()).then(d=>{
+  fwlocal.textContent=d.local;
+  fwremote.textContent=d.remote;
+  ghstatus.textContent=d.status;
+  ghauto.textContent='AUTO UPDATE: '+(d.auto?'ON':'OFF');
+  ghauto.dataset.on=d.auto?'1':'0';
+ });
+}
+
+function githubCheck(){
+ ghstatus.textContent='Verific GitHub...';
+ fetch('/github-check',{cache:'no-store'}).then(r=>r.json()).then(d=>{
+  fwlocal.textContent=d.local;
+  fwremote.textContent=d.remote;
+  ghstatus.textContent=d.status;
+  ghauto.textContent='AUTO UPDATE: '+(d.auto?'ON':'OFF');
+  ghauto.dataset.on=d.auto?'1':'0';
+ });
+}
+
+function githubToggle(){
+ let enable=(ghauto.dataset.on==='1')?'0':'1';
+ fetch('/github-auto?enable='+enable,{cache:'no-store'}).then(r=>r.json()).then(d=>{
+  ghauto.textContent='AUTO UPDATE: '+(d.auto?'ON':'OFF');
+  ghauto.dataset.on=d.auto?'1':'0';
+  ghstatus.textContent=d.status;
+ });
+}
+
+function githubUpdate(){
+ if(confirm('Instalez versiunea noua de pe GitHub?')){
+  location.href='/github-update';
+ }
+}
+
 function refresh(){
  fetch('/status',{cache:'no-store'}).then(r=>r.json()).then(d=>{
   state.textContent=d.state;
@@ -227,6 +524,7 @@ function refresh(){
 }
 setInterval(refresh,1000);
 refresh();
+githubRefresh();
 </script>
 </body>
 </html>
@@ -374,6 +672,11 @@ void setup() {
   updateDAC();
 
   startWiFi();
+
+  preferences.begin("ewat", false);
+  githubAutoUpdate =
+    preferences.getBool("ghAuto", false);
+
   setupArduinoOTA();
 
   server.on("/", HTTP_GET, [](){
@@ -385,6 +688,11 @@ void setup() {
   server.on("/manual", HTTP_GET, handleManual);
   server.on("/auto", HTTP_GET, handleAutomatic);
 
+  server.on("/github-info", HTTP_GET, handleGithubInfo);
+  server.on("/github-check", HTTP_GET, handleGithubCheck);
+  server.on("/github-auto", HTTP_GET, handleGithubAuto);
+  server.on("/github-update", HTTP_GET, handleGithubUpdate);
+
   setupWebUpdate();
 
   server.begin();
@@ -395,5 +703,6 @@ void loop() {
   ArduinoOTA.handle();
   updateChillerState();
   updatePressureSimulation();
+  processAutomaticGithubUpdate();
   delay(2);
 }
